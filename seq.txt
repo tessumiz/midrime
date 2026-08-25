@@ -1,0 +1,776 @@
+NEW KWD: 'raw'
+——————————————
+
+Just like how 'ref' works for objs, 'raw' is a new type for seqs and hashed types.
+
+'raw' strs/lists/dicts/sets use single-indirection (like Rust) than use a proxy handle.
+
+This is expecially good inside tight loops. Use this wisely, else ref aliases could potentially turn stale.
+
+str a = "123"
+raw b = a  // b clones a's in_ref proxy
+
+str c = b  // illegal; one source of truth rule
+raw str c = b  // also illegal
+
+
+raw str has its own static typ_id of 8, while the raw generics have their own dyn gen typ_id (as usual).
+
+Note: Interned (aka fix) seq/hash types will always be "raw", as they never change, so fix raw str is
+redundant and hence illegal.
+
+
+NEW META
+————————
+
+Seqs with strings can now be easily made with s':
+
+s'(FOO, BAR, QWE)  // the same as ('FOO', 'BAR', 'QWE')
+
+s'([(A, B, C), (CAT, DOG, PET)], [(X, Y, Z)])  // works up to any level of depth
+
+
+This is particularly useful for meta-programming.
+
+
+
++----------------+
+| Sequence Types |
++————————————————+
+
+To have a compromise between dispatch cost and opcode bloat, and to make the VM's code less redundant,
+strs/arrays/lists use the same ABI internally for storing their byte-streams:
+
+[cap: 4B] [len: 4B] [data_arr]
+                     ^ in_ref (<- out_ref)
+
+Len and cap are strided; cap = (ALLOC_CAP - 8) / size.
+ALLOC_CAP starts at a minimum of 6 elms (64B). Alter this with the 'resv' kwd.
+
+Arrays directly store a ref pointing to data_ref, while strs and lists store a ref pointing to another
+ref (in the heap) which points to the data_ref in the heap. Every realloc only updates the inner ref,
+preventing stale aliased refs.
+
+For strs and lists:
+ref (stack) -> in_ref (heap) -> seq_data
+
+
+GET/SET
+———————
+
+They utilize common load/sto instrs:
+
+x = seq[i]  // seq is of type T and x of type U
+
+Note:  $r assumes single-indir; for non-raw str/list, the compiler should emit a deref
+[LDR] [$monoref] [$diref] [0]
+
+
+1. Both vals:
+
+(i) If 'x' is a loc var of the curr frame which hasn't been spilled yet,
+
+[LDR] [$x] [$r] [$i]  // 'i' is auto-scaled
+// [ITOF_S/...] [$x] [$x]  =>  optional cast by the compiler
+
+(ii) Else:
+
+[LDR] [$t] [$r] [$i]
+// optional cast
+[STO_FPO] [$t] [x_off]  // elif global, [STOI] 
+
+
+2. T is obj, U is ref:
+
+[ISCALE] [$x] [$r] [$i] [<getsz(T)>]  // added by the compiler
+
+
+3. Both refs
+
+[LDR] [$x] [$r] [$i]
+
+
+4. Objs
+
+// V (val) means seq is an arr of objs which need to be copied to the dest addr in $d;
+// R (ref) means seq is a ref arr of objs which need to be derefed first
+
+// 1-indir
+[SEQ_GET_OBJ_V1] [$d] [$r] [$i] [size: 7]
+[SEQ_GET_OBJ_R1] [$d] [$r] [$i] [size: 7]
+
+// 2-indir
+[SEQ_GET_OBJ_V2] [$d] [$r] [$i] [size: 7]
+[SEQ_GET_OBJ_R2] [$d] [$r] [$i] [size: 7]
+
+Set variants:
+[SEQ_SET_OBJ_V1] ...
+...
+
+
+Resv (only for alloc / copy)
+————————————————————————————
+
+The universal form of resv is raw bytes; the compiler converts all other forms to this:
+
+Note: the AssignStmt node DOESN'T store resv as an Expr, but as an i32.
+
+s = "" resv 100B  // 100B including metadata; alloc decides true cap
+s = "abcd" resv +100B // requests 100B more from existing data
+
+s = "" resv 100  // 100 elms; conv to byte (8 + 100 * getsz(T))
+s = "abcd" resv +10  // 10 more elms
+
+
+s.resz(50)  // takes cap either in elms or B; no '+'
+s.resz()    // resizes to fit len
+
+
+All of these are requests; the alloc decides. If you request 100B and the next pool is 128B, you'll get
+100B. Elif you've overflown to the general heap, you'll get whatever is available (cap >= 100B).
+
+For arr/raw, if seq_ext triggers an overflow (aka resv n wasn't enough), an error will be thrown.
+
+
+For clearing len (without resize):
+[SEQ_CLR_LEN] [$s] [is_2ref]
+
+
+Operations
+——————————
+
+Note: If is_2ref=0 (single indir, arr/raw) and a resize is triggered, the VM throws an error.
+
+
+Heavy ops ($i is idx):
+
+# d => any data addr;  r => either in_ref or out_ref
+
+# is_2ref = 1 => non-raw lists/strs/dicts/sets
+# is_2ref = 0 => arrs, raw lists/strs/dicts/sets
+
+I) Alloc and meta
+------------------
+
+1. [SEQ_ALLOC] [$d] [$cap] [is_2ref: 1 | size: 7]  // is_2ref=0 -> $d is only singly indirected.
+// $cap gets requested, and the allocated cap (cap >= $cap) gets written
+
+2. [SEQ_MK_CNST] [$d] [$cap] [is_2ref | size]  // clones a cnst-pool seq into mutable memory
+   [const_pool_addr: 4B]  // use this instead of [LDR + SEQ_MK_REF] for const loads
+
+3. [SEQ_MK_REF] [$d] [$r] [$cap] [is_2ref | size]
+
+4. [SEQ_RESZ] [$out_ref] [$new_cap] [size]  // expands, shrinks or stays the same.
+// Safe; performs checks with len inside.
+// you obviously can't have is_2ref=0 here
+
+
+II) Basic; non-polymorphic
+---------------------------
+
+1. [SEQ_INS]  [$r] [$s] [$i] [is_2ref: 1 | size: 7]
+// ins of obj into seq ref obj is unusual; the compiler will emit a manual deref
+
+
+2. [SEQ_EXT_RAW]  [$r_d] [$r_s] [$i] [is_2ref_d: 1 | is_2ref_s: 1 | size: 7]
+// $s must point to another seq (type-match)
+// for anything else (obj <ext> ref obj / ref obj <ext> obj, use the instr SEQ_EXT_OBJ)
+// size is switched internally to 1B, 2B, 4B and a general nB routes.
+
+
+3. [SEQ_EXT_RAW_END] [$r_d] [$r_s] [$rep] [is_2ref_d | is_2ref_s | size]
+// tail-extend
+
+
+4. [SEQ_POPI] [$r] [$i] [is_2ref: 1 | size: 7]
+// no pop instr returns the value; use get before
+
+
+5. [SEQ_SLICE] [$d] [$ir] [$st] [$end]  // allocs and assigns a brand new seq to $d
+   [$step] [is_2ref: 1 | size: 7]  // wide-instr
+
+
+// a deref_s flag to combine prim and obj variants into one is sub-optimal because 
+6. [SEQ_FIND_PRIM] [$r] [$s] [$t] [is_2ref: 1 | size: 7]  // treats $s as val
+
+7. [SEQ_FIND_OBJ] [$r] [$s] [$t] [is_2ref: 1 | size: 7]  // deep equality; treats $s as ref obj
+
+
+8. [SEQ_RMV_PRIM]  [$r] [$s] [$t] [is_2ref: 1 | size: 7]
+
+9. [SEQ_RMV_OBJ]  [$r] [$s] [$t] [is_2ref: 1 | size: 7]
+
+10. [SEQ_CMP_RAW] [$t] [$ir1] [$ir2] [is_2ref: 1 | size: 7]  // (>, 1) (<, -1) (=, 0)
+// assumes sizes match; compiler converts into poly form if types don't match, creating the
+default casting _funcs (or if only one requires a deref / any other special case, refer fn_obj)
+
+
+
+III) Polymorphic (static)
+-------------------------
+
+These entirely rely on thunks generated by the compiler. The initial plan was to load all data into a
+stateful stack frame and manually handle it across calls (just like Python's yield works):
+
+[SEQ_FIND_POLY] [$r] [$s] [$t] [is_2ref: 1 | r_size: 7]
+[s_size: 7] [EQU_FNPTR: 24]
+
+A helper populates the stack like this:
+
+[prelude_find (ret_ip | ret_fp)] [ret_val] [stride] [seq_len] [i] [val] -
+[equ_ptr] [prelude_eq] [cmp] [seq_ptr] [val_ref]
+
+// cmp is preset to 1, i to 0, val_ref to point to [val]
+
+This actually performs worse, especially since random dispatches mess up TAGE's predictions. Hence, Midrime
+thunks for each (T, U) pair present will be emitted:
+
+
+
+1. Find
+
+_seq_find__Bar_in_Foo_list(raw list<Foo> lst, Bar val) -> i32:
+  for i, x in lst:
+    if _equ__Foo__Bar(x, val):
+      give i
+
+  give -1
+
+
+2. Remove
+
+_seq_rmv__Foo(raw list<Foo> lst, i32 val):
+  w = 0
+
+  for r, x in lst:
+    if !_equ__Foo__i32(x, val):
+      if r != w:
+        lst[w] = x
+      w++
+
+  /*
+  // if it were list<ref Foo>, the empty slots must be set to nullref for the GC:
+
+  null = ?
+  st = w
+  bytes = (lst.len - w) * Foo.size
+  { MEMREP $st, $null, $bytes }
+
+  */
+
+  lst.len = w
+
+
+3. Compare
+
+_seq_cmp__Foo_list__raw_str(raw list<Foo> lst, raw str s):
+  if lst.len > s.len: give 1
+  if lst.len < s.len: give -1
+
+  for i in ..lst.len:
+    cmp = _cmp__Foo__i32(lst[i], s[i])
+    if !cmp: continue
+    give cmp
+
+  give 0
+
+
+4. Extend
+
+_seq_ext__Foo_list_to_Bar_list(list<Foo> s, list<Bar> d_, i32 idx):
+  len = d_.len + s.len
+
+  i32 d_ptr
+  BC {
+    SEQ_RESZ $d_, $len, <Bar.size>
+    LDR $d_ptr, $d_, 0
+  }
+
+  raw d = d_
+  
+  if idx < d.len:  // for optimizing tail-extend
+    bytes = (d.len - idx) * Bar.size
+    src = d_ptr + idx * Bar.size
+    dest = src + s.len * Bar.size
+    BC { MEMMOV_R $dest, $src, $bytes, [1] }
+
+  for i in ..s.len:
+    d[idx + i] = _cast__Foo_to_Bar(s[i])  // no out-of-bounds error for set ops
+
+  d.len += s.len
+
+
+5. Map
+
+lst = b.map(func)
+
+_seq_map__T_to_U(raw list<T> src, (T -> U) func) -> list<U>:
+  list<U> dest_
+  
+  BC { SEQ_ALLOC $dest_, $src.len, <U.size> }
+  raw dest = dest_
+
+  for i, x in src:
+    dest[i] = func(x)
+
+  dest.len = src.len
+  give dest_
+
+
+6. Filter
+
+a = b.filter(func)
+
+_seq_filter__T(raw list<T> src, (T -> bool) func) -> list<T>:
+  list<T> dest_
+  
+  BC { SEQ_ALLOC $dest, $src.len, <T.size> }
+  raw dest = dest_
+  
+  i32 curr_i = 0
+
+  for i, x in src:
+    if func(x):
+      dest[curr_i++] = x
+      
+
+  dest.len = curr_i  
+  give dest_
+
+
+
+IV) Utils
+----------
+
+func(<seq>)
+
+1. [SEQ_SUM] [$r] [is_2ref: 1 | type: 3]  // the usual i8/u8/... for type
+
+2. [SEQ_MIN] [$r] [is_2ref | type]
+
+3. [SEQ_MAX] [$r] [is_2ref | type]
+
+
+Note: min(x, y) and max(x, y) directly compile to ternary ops; you can't do this for min(x, y, z)/...
+Numerics are auto-cast appropriately.
+
+
+V) Variated
+------------
+
+PUSH/POP are variated (8/16/32/obj and 8u/s/16u/s/32/obj respectively) by expending opcodes since these
+are hot ops, and I have to reduce decode and branch-misprediction cost. This is to not compromise speed.
+
+[PUSH_16S] [$r] [$v] [is_2ref: 1]
+...
+[PUSH_W] [$r] [$v] [is_2ref: 1] [size=4: 7]
+[POP_16S] ...  // DOES NOT return value
+...
+
+Net opcodes expended = 12
+
+
+NOTES
+-----
+
+>> Size isn't just limited to 1, 2, and 4 bytes; raw data obj comparison (for eg., xyf) is allowed; mult is
+around as fast as bitwise due to pipelining.
+
+
+>> Types must match for ins, ext and make instrs. += is overloadable for ext; refer "oops and boxing".
+
+
+>> Adding two or more (as in chained add) seq would compile down to a big alloc and a copy of each into it.
+This is better than a dedicated [SEQ_ADD] instruction.
+
+
+Capacity hysteresis
+———————————————————
+
+This is also a strict, immutable part of the seq ABI.
+
+Expansion happens when new_len > cap; if the final seq can fit in a slab pool (refer Slab Pools in "MemModel"),
+realloc there. Else (aka general heap), expand the buffer by 1.5x. This minimizes growth waste.
+
+Shrinking isn't done automatically. Use SEQ_SHR to attempt a shrink. Auto-shrinking usually
+checks if cap > thresh and len < (cap / 4) and halves the cap if so. This check being slow was omitted.
+
+Reallocs always update the in_ref with the new data_ref.
+
+
++---------+
+| Strings |
++—————————+
+
+ASCII-encoded, not null-terminated (to align with the SEQ ABI), unless interned by the compiler.
+Always stored in the heap (SSO was removed to kill bloat):
+
+[cap: 4B] [len: 4B] [char_arr]
+                     ^ data_ref
+
+
+Interning
+—————————
+
+Literals assigned to fixed vars are interned in the const pool. They store an extra hash at the start:
+[hash: 4B] [cap: 4B] [len: 4B] [char_arr]
+
+fix s = "123"  // cnst ref copied; [LDVAL_19] [$s] [cnst_off]
+fix s = a  // forbidden
+
+Any comparison with "fix str" always compares hashes.
+For this equality, the compiler emits this for cmp bw fix str and str:
+
+[STR_OP] [CMP_FIX_AND_STR] [$fix_s] [$s] [$cmp_res]
+
+For cmp bw fix strs, refs are compared.
+
+
+Note: 'fix' doesn't intern objs, as only str/list/arr can be stored in the cnst pool.
+
+
+Defaults
+--------
+
+a = fix_s  // if 'a' hasn't been decl, a's type will be str (and not fix str)
+
+<fix str> + <fix str> => <str>  // unless compressed by the compiler, but we're talking dyn behaviour
+<fix str> * k => <fix_str>
+<fix str> + <str> => <str>  // commutative
+
+
+Type system
+-----------
+
+fix means the var is locked, as well as the data inside (no mutation ops)
+
+fix on numeric types is just a qualifier for the variable, not a separate type.
+fix str serves both as a qualifier AND a type (because of the extra hash field)
+fix list/arr just mean raw list/arr also interned in the cnst pool; cnst stk arr is not a thing
+
+
+Operations
+——————————
+
+A lot of str/list/dict operations are done through "pseudo-fields/methods", which uses the dot-syntax
+but is actually syntactic sugar which the compiler resolves directly to bytecode. Refer "CompilerDocs"
+for the impl of pseudo fields/methods and pseudo chaining.
+
+Almost all heavy ops would be seq ops, the rest would be sub_ops multiplexed as:
+
+[STR_OP] [<sub_op>: 5] ...
+
+
+Creation
+--------
+
+Hardcoded literals are stored in the SEQ ABI by the compiler in the const pool. Initial cap can be set
+with the 'resv' kwd (refer strings). The data_ref is then passed to this helper sub-op which creates
+the $d => inner_ref => data hierarchy in the heap:
+
+s = "123"
+
+For repetitive creation:
+s = str('a', 100) resv 1000
+
+// refer the last section for the instrs
+
+
+Casts
+-----
+
+Refer "oops and boxing" for custom casts.
+
+The 'str/chr' pseudo-funcs are used for casts and repeat. 'chr()' takes either a num, or a numeric
+arr/list and treats their elms as ascii vals. 'str()' does itoa instead, also allowing other strs
+as args.
+
+chr(97)  => "a"
+str(97)  => "97"
+(str)97  => "97"
+
+chr('c', 3)  // 'c' is just (u8)99; "ccc"
+
+chr([1, 2, 3], 10)  // "\1\2\3" rep 10
+
+s = [1, 2, 3]
+[STR_OP] [I32_JOIN] [$s] [$l]
+
+
+str("asdf", 5), str([97, 98, 99], 3) aren't allowed; use * instead; using asterisk for 'c' would
+just multiply the i8 with that
+
+
+(str)'c' // "97"
+
+str m  // nullref; aka 0xFFFFFFFF
+m = s  // copies by ref
+str k = s  // copies by ref again
+
+k = s.copy()
+k.assign(s)
+
+
+s += 97  // += "97"
+s += chr(97)  // syntactic sugar for s.push_char(97); chr(97) in isolation evals to "a"
+
+
+Data
+-----
+
+Pseudo-fields/methods like .len, .cap, .empty(), .hash() resolve to instrs like:
+[LDR] [$l] [$data_ref] [-8]  // retrieves len
+...
+
+
+Concat
+-------
+
+>> Concat/mult (c = a * b) create new strs:
+
+Uses SEQ_ADD / SEQ_FILL (for mult)
+
+
+>> In-place concat (c += a). Depending on a's type, it could boil down to 2 instrs.
+SEQ_EXT for strs, and for char, SEQ_PUSH_16U.
+
+
+>> s.pop() uses SEQ_POP_16U while s.pop(i) [overloaded pseudo-method] uses SEQ_POPI
+
+rest of the seq ops...
+
+
+Resizing
+--------
+
+Pseudo-method:
+str.resz(100)  // calls SEQ_RESZ
+
+
+Utility
+-------
+
+Pseudo-methods: .count, .find, .strip, .repl, .split
+Pseudo-fields : .isupr, .islwr, .isnum
+
+lst = "1, 2, 3".split(", ")  // of type List<str>
+[STR_OP] [SPLIT] [$l] [$s] [$s_delim]
+
+Str comparisons are always O(n) (since they use SEQ_CMP). Consider creating an operator-overloaded cls
+which caches hash if found necessary.
+
+
+
++--------+
+| Arrays |
++————————+
+
+An array is a sequence in its pure form. It has the exact same ABI as a sequence, and lacks the
+double-indirection found in strs/lists. Also, arrays can exist purely in the stack.
+
+In Midrime, they are treated like buffers with a static capacity. Overflows will lead to an error; the
+only exception is trying to use 'set' on an idx beyond the arr bounds.
+
+
+Primer
+——————
+
+i32 a[30]  // creates a 128B sequence in the stack (garbage-filled)
+i32[10] a // illegal; bad syntax
+i32[] b  // all seqs are ref types; this just reserves a 4B slot for b set to nullref
+b = a   // perfectly plausible
+a = b  // illegal; a is liable to retain its own inited array!
+
+i16[] c = a  // illegal; type mismatch
+
+
+c  = (1, 3, 4) + (4, 5)   // illegal
+c  = (1, 3) + (4, 5) * 6  // yields XY<i32>
+a += (1, 2, 3)  // extend with temp heap obj; SEQ_EXT
+
+
+fix i32 k[1000]  // lives in the const pool
+
+
+To prevent breaking the GC, un-inited ref arrs are filled with nullrefs by default:
+
+(ref Foo) a[]  // illegal
+(ref Foo)[] a  // legal
+(ref Foo) a[30]  // an arr of 30 nullrefs
+
+
+Multi-dim array
+———————————————
+
+For multi-dim arr access, the compiler uses ISCALE (if 2D) else a combo of MULT and ISCALE
+for >= 3D.
+
+i32 a[30][20]  // of type i32[30][]
+a = 0  // zeroes the garbage out; decays to SEQ_FILL
+
+<seq> = <val>  // fills the whole seq's cap iff seq is either arr or list/raw list. Does not
+change len.
+
+
+i32 arr[100]
+alt_arr = (i32[2][])arr  // alternate, strided access
+
+
+Most seq ops apply to arrays (including push +=, concat +, mult *, insert, etc.).
+There will be bounds check for mutative ops.
+
+
++-------+
+| Lists |
++———————+
+
+Arrays, but dynamic (dual-indirected):
+
+list<u16> k resv 100  // preallocs list of size 100
+k = [1, 2, 3]  // ditches prev list
+k = [19] * 5  // stores 19 five times; ditches previous
+
+
+Extend and casts
+————————————————
+
+The .extend pseudo-methods are special; the compiler resolves them heterogenously:
+
+s += (('a', 'b', 'c')).join()  // default is no-delim; same as (i8[])(97, 98, 99)
+
+
+(i8[])(1, 2, 3)  // legal
+k += list("123") // converts each to ascii
+a = (i32) "123"  // legal
+
+Note: the pseudo-constructor syntax list("123") will fail; it's only for repetition of T vals
+
+
+Literal assignment
+——————————————————
+
+a = [1, 2, x, 4]
+
+The compiler replaces all runtime vals with dummy vals (-1 aka 0xFFFFFFFF) and creates the list in the
+cnst section, emitting code to either make it in the heap, or to pass the ref over (interned), followed
+by an instr to fill the dummies at runtime; a[2] = x.
+
+Dummy val is always -1 for refs including str/list/... (including ref-fields in objs) for GC compatibility
+and garbage for numeric types. 
+
+
++-------+
+| Views |
++———————+
+
+** DEFERRED TO THE FUTURE VERSIONS **
+
+An outline
+——————————
+
+Views refer to a contiguous section of a seq (of step 1). The supported operations are get, set, find,
+slice (as lval); ext (as rval); add, cmp (as either)
+
+[len: 4B] [start_ref: 4B]
+           ^ out_ref
+
+
+For get/set, [SEQ_GET_OBJ_V2]/[SEQ_SET...] is used. New isntr variants exist for find, slice, etc.
+(making the mainstream seq funcs accept view (using cap=-1/etc. gimmicks) would only make the common
+path slower).
+
+
+seq[st:end:step] returns a slice; use seq.view(st, end, step) to get a view
+
+
++--------+
+| Combos |
++————————+
+
+1. Making from literal
+a = [1, 3, 5]  // seq_mk_cnst
+
+2. Making from other
+a = b  // copies ref
+
+3. a = .copy()  // uses seq_mk_ref + ref-copy while a += .copy() creates a temporary (the latter
+case is pointless anyways)
+
+4. a = "asd" + "qhja"  // auto-concat in const pool by compiler
+
+5. a += b + c * k + d
+// net size calced dynamically (if any of the vars aren't known at compile-time), 'a' resized, and
+seq_ext_raw_end used
+// if 'a' has resv specified (either resv n or resv +n), this dyn calc is skipped for resv n. This is a
+performance decision which assumes the user knows what they are doing; re-allocs might happen if 'n' is
+arbitrary.
+
+6. a = b + c * k + d
+// same as (5), except seq_alloc is used first
+
+7. a.write(b + c + d)
+// same as (5), except len manually set to 0 first
+
+8. s = "a" + s1 + X + "c" + "d" + s2
+// literals close together are combined and stored in cnst pool (aka "a" and "cd"). If X is an str/numeric
+type or a compatible list/arr, same case as (6). Else, it's evaluated as  "(t1 + X) + t2" and finally assigned
+(2) to 's'
+// op+() returns a str; it can't be used to build the strs in-place.
+
+9. l = [1, 2, x, 4] + "abc"  // a folded dummy  [1, 2, x, 4, 97, 98, 99] ("abc" widened) is created in cnst pool
+with x as a dummy. This is mk_cnst loaded, and then seq_set is emitted; folding happens with any compatible
+heterogenous sequences
+
+10. l = [1, 2, 3, 4] * 10
+// unrolls the mult in the cnst pool if the net size is below 100B, ELSE stores only [1, 2, 3, 4], seq_allocs l
+with aggregate size, and fills the data using SEQ_EXT_RAW_END
+// if 'l' is 'fix lst', this 100B-cap is ignored and the whole list gets made in the cnst pool
+
+11. l = [1, x, 3] * 3  // WILL NOT unroll the mult in the cnst pool; [1, 0, 3] is loaded in the heap, 'x' set,
+and then proceeds similar to (10). Since views don't exist yet, I can't load it directly into 'l' and process
+it; if I have to do so, I wouldn've to emit set instrs for each repetition, which has been avoided.
+
+12. l = [1, x, 3] * k  // treated the same as (10); mult done separately with seq_ext_raw_end
+
+
+13 s = (1, 2, 3)  // "123" is stored in cnst, loaded with mk_cnst
+
+13.25 s = chr((1, 2, 3))  // "\1\2\3" stored insteac
+
+13.5. str s = (1, 2, x, 3, 4)  // list stored, loaded into tmp, x set, and str_op i32_join instr used
+
+14. str s = str(89, 10) (or chr(89, 100))  // similar; put in the cnst pool if net size is within 100B, else
+seq_ext_raw_end is called (which uses exponential growth for $rep, hence is very fast
+
+
+15. Refer fn_obj for func involvement:
+s1 = foo(s2)
+s = [1, 2, 3] + foo(s1 + [3, 4]) + 56
+
+
+16. a = [obj1, x, obj2]  // exact same procedure, except any ref fields in dummy_obj are init to nullref
+
+17.
+a = (["abc"], ["ab", x, "c"], ["e", "f"])  // of type list<str>[]
+// all strs and dummy-lists are created in the cnst pool, and later each list is assigned the str using mk_cnst
+// if list<raw str>, still the same except double-indir wouldn't be there
+// if list<fix str>, 'x' is illegal. Assuming all cnst str literals, the lists will be made populated with the
+cnst str refs
+
+
+18.
+s = (i16[])(97, 98, 99)
+
+// the compiler creates a cast thunk:
+_cast__i16_arr_to_str(i16[] a, str t):
+  // 't' must be empty and the capacity must be already set
+
+  for i in a:
+    t += chr(i)
+
+
+
+Notes:
+>> Any dynamic var will be cast as seen appropriate. For s1 + x + s2, 'x' is cast. Elif for x + s2, x.op+(s2)
+is tried, if fails a cast is tried, else error. Since ops aren't commutative, <prim> <op> <obj> will ONLY be
+interpreted as <prim> <op> cast(<obj>).

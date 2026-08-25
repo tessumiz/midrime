@@ -1,0 +1,205 @@
++-------+
+| Dicts |
++———————+
+
+Dicts use a similar impl to absl::flat_hash_map (no SIMD); DOD is used to make lookups fast:
+
+
+                               stack =>  [ dict_ref ]
+                                                |
+                                                *
+                                         [ in_ref ]  <= heap
+                                           |
+                                           *
+[ count: 4B ] [ cap: 4B ] [ kv_ref: 4B ]  [ 4B hash_arr ]  <= H array; heap
+                             |
+                             *
+[k_size: 2B | v_size: 2B] [ <k, v> dense array ]  <= KV array; heap
+
+
+
+Hashing
+———————
+
+Hashes are u32 nums. An algo like Murmur3 (int) or FNV (str) will be used, except that since '0'
+is reserved to mark an empty slot, any 0s the algos calc will be clamped to 1 (using CMOV). Now,
+the LSB can multi-task; it can serve as the entropy bit for the large majority, while also repr
+empty cells.
+
+Custom hashes for user-def objs are allowed via the .hash() method. This is discussed at the end.
+Default hashes exist for numbers and strings, but not for lists; must make custom hash for it.
+
+
+H/KV arrays
+———————————
+
+These maintain a power-of-2 cap in order to avoid modulo and use (hash & (cap - 1)) instead. Attempting
+to resv anything else will raise a compile error.
+
+Linear probing with back shift deletions would be used; tombstones are only good if there aren't
+frequent deletions.
+
+The separation of H and KV (as in absl::flat_hasp_map) allows a larger load-factor threshold because
+of a greater cluster rejection speed. It will be slightly slower than AoS maps for lower load-factors.
+
+The load-factor is 75%. Beyond this, the cap doubles. Because of H_arr, rehashing is never a thing;
+only the new bucket pos has to be recalced.
+
+The KV arr stores both K and V sizes as header.
+
+
+Operations
+——————————
+
+hash(123)
+[GET_HASH] [$h] [$v] [size: 4]
+
+hash(foo)
+// refer custom hashing
+
+
+dict<i32, str> d  // nullref
+d = { 1: "a" }  // starts at a min cap of 16
+
+x = d[5]
+// k_type is 0-7 for i8, u8, i16, u16, i32, str, obj
+[DICT_GET] [$x] [$d] [$k] [k_deref: 1 | k_type: 3] [$h]  // 32-bits worth of info
+// $h is read iff obj (aka k_type == 7); hash is auto-calced for all k_type <= 6
+
+Currently, poly is not supported; all checks compare the raw data (refer the last section).
+K can't be list/arr/dict/set. Strs are obviously allowed, but make sure they never mutate.
+
+
+d[5] = "b"
+[DICT_SET] [$d] [$k] [$v] [k_deref: 1 | k_type: 3] [$h]
+
+
+d.rmv(5)
+[DICT_RMV] [$d] [$k] [size] [k_deref: 1 | k_type: 3] [$h]
+
+d.resz(128)
+[DICT_RESZ] [$d] [new_cap]
+
+d += { ... }
+[DICT_EXT] [$d1] [$d2]  // dicts must be homogenous
+
+
+Hashing, calcing and looking up the bucket, writing data, performing load-factor checks all deem
+dict methods to be heavy enough to deserve MUX-ing.
+
+
+Literal init
+—————————————
+
+d = { 1: "a" }  // starts at min cap of 16
+[DICT_MK] [$d] [$data]  // where $data is simply a stream of [len] [k_sz=4] [v_sz=4] [1, "a"] in
+the cnst pool, ONLY IF V is either fix str or raw str; else, the compiler stores a dummy [1, -1]
+and later emits a seq_mk_cnst for materializing "a" and setting it via dict_set.
+
+Values which can only be resolved at runtime will be filled with dummy data (-1 for numeric) and
+sto instrs will be emitted to fill their slots (just like the case with lists/arrays).
+
+If any key is runtime-dependent, a fitting capacity is calced and an empty dict of that size is
+alloced:
+
+[DICT_ALLOC] [$d] [N]  // cap = 1 << N
+[DICT_SET] ...
+
+The whole dict is built from scratch, as preallocs could mess up with deterministic writes; if 2: 5
+gets pre-made in { x: 1, 2: 5 }, if x is 2 the dict would hold { 2: 1 }, the opposite of the expected
+order. Separate it for maximal performance:
+
+d  = { 2: 5, 4: x, ... }  // static keys
+d += { y: 6, z: 89, ...}  // dynamic keys
+
+
+In the cnst pool, dict data is packed as [k1, v1, k2, v2, ...]. The actual data structure must be
+assembled by DICT_MK from this dense form.
+
+Initial load factor would be 50%; using resv with a load factor > 75% would lead to a compile error.
+
+
+Custom hashing
+——————————————
+
+There is no separate opcode for this; the hash func is called, and the 1-clamped result is returned.
+
+cls Foo:
+  // i16 might result in unwarranted sign-extension. A 16-bit return is only part of annotation;
+returns are always at least 4B. This annotation is a reminder to the user to bring about maximum
+entropy in the lower half of the word.
+
+  hash -> u16:
+    // calc hash val
+    give val  // compiler emits a CMOV here
+
+
+h = (789).hash  // normal hash; primitive hashes can't be overridden
+
+
+NOTE: Since 0 is chosen to be the sentinel for empiness, [GET_HASH_] has an inner branch which
+auto-clamps a 0 from the custom hash into a 1.
+
+
++------+
+| Sets |
++——————+
+
+Sets are just treated as dict-special cases:
+[k_sz: <size> | v_sz: 0]
+
+The VM back-end checks v_sz == 0 to decide the operation.
+
+
+Operations
+——————————
+
+set<i32> a = { 1, 2, 3 }
+
+
+x = 5 in s
+[DICT_GET], except $x stores a boolean instead
+
+s += 5
+[DICT_SET], except "v" is a dummy and "k" is inserted
+
+rmv, resz and ext stay the same
+
+
+Iteration
+—————————
+
+[DICT_NXT] [$k] [$v] [$h_ref] [$curs]  // skips $v if it's a set so that
+dummy vregs (even with useful data) could be used and they neverr get overwritten
+
+for k in d: // value is loaded into a reg but unused; hence why it's identical to 'for k, v in d'
+for k in s: ...
+
+for k, v in d:
+  sum += k
+
+// init
+[LDVAL_19]  [$curs] [0]
+[LDR_32] [$h_ref] [$dict_ref] [0]
+
+LOOP_ST:
+
+[DICT_NEXT] [$k] [$v] [$h_ref] [$curs]
+[JEQ_IMM] [$curs] [-1] [END]
+[IADD] [$sum] [$sum] [$k]
+[JMP] [LOOP_ST]
+
+LOOP_END:
+
+
+There are no further optimizations to iterate through dict keys / set vals; the control has to
+reject any linear clusters in linear time; DOD makes this fast.
+
+
+Poly; kept for later
+————————————————————
+
+Currently, all equality checks work on raw data (deref is there). Poly checks (using the manual
+trampolining approach discussed in seq) are kept for the future version. Note that whole thunks
+were emitted for seq since the bottleneck was the func call, unlike hashtypes where trampolining
+saves time. Yes, re-entrancy will be used with the stack acting as the persistent storage.

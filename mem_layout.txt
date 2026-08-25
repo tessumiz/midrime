@@ -1,0 +1,6 @@
+[code: <var_size>]
+[cnst: 512KB]
+[stack: 256KB]  // first frame is GLO
+[heap: pow-2 pools, net 1MB]
+[heap: general; 2MB]  // doubly linked free list; best fit coalescing
+

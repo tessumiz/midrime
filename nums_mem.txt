@@ -1,0 +1,267 @@
++--------+
+| Primer |
++————————+
+
+>> The biggest primary dtype is 4B, the same size as of the 32 frame vregs.
+
+>> Var type is auto-implied whenever possible; you can omit it at places. Use the var kwd
+
+>> Vars are mutable by default. Midrime uses the kwd "fix" instead of "const". It replaces numeric
+values as such, while interning strs, lists and arrays. It doesn't replace obj. fix ref works just
+like const&.
+
+>> Bytecode is mostly fixed-width at 4B, with 1B for opcode (plus any mux-ing for heavy instrs).
+Only LOAD_IMM is double-width.
+
+
+>> Bools and chars don't exist:
+
+alias bool = i8
+alias char = i8
+
+fix true = 1
+fix false = 0
+
+'c' => compiler converts this to (i8)99
+
+
++---------+
+| Numeric |
++—————————+
+
+i8, u8, i16, u16, i32, u32 and f32. char/bool don't exist separately from i8/u8.
+
+Numeric literals are i32 by default. Use u/f suffixes as needed. Casting uses C's syntax.
+
+
+Sign-agnostic arith/logical instrs
+——————————————————————————————————
+
+(IADD, ISUB, IMUL, LSHFT), (BAND, BOR, BNOT, BXOR), (EQ, NE)
+[OP: 8] [$dest: 5] [$op1: 5] [$op2: 5]
+
+Note: There are no logical AND/OR/NOT ops; use bitwise ops instead
+
+
+Sign-dependent
+——————————————
+They have s and u counterparts; IDIV_S, IDIV_U
+
+(IDIV, IMOD, RSHFT), (ILT, ILE)  // GT/GE compiles to LT/LE
+
+
+Floats
+——————
+(FADD, FSUB, FMUL, FDIV, FMOD), (FLT, FLE)
+
+
+float/int casts
+———————————————
+FTOI_S, FTOI_U, ITOF_S, ITOF_U
+
+
+Integer casts only use sig_ext:
+SIG_EXT_8, SIG_EXT_16  // sig-exts 8 and 16 w ints to i32
+
+Downcasts and sig-unsig casts are allowed
+
+
+Ops between s, u and f
+_______________________
+
+For s <sign-dep-instr> u, the compiler casts u -> s. This includes comparison too.
+For the sake of speed, comparison between s and u is not safe; emitting 3 opcodes for checking
+the signed int's sign, performing an unsigned op on both and AND-ing them is too slow, especially
+for conditional jumps (JLT_U).
+
+s < f and u < f are safe; the compiler casts them properly with ITOF_S/ITOF_U.
+
+
+Immediates
+___________
+
+They end with the _I suffix; like IADD_I. Applicable for all i/u arith and comparison ops.
+Imms are always signed (even for sign-agnostic ops), having a range of ±8192.
+
+MUX-ing has been strictly avoided for reducing branch misprediction penalty for basic instrs.
+
+
+Evaluation
+———————————
+
+a = 1 + 2 * 5 + x << 2 + 4
+// iff 'x' is numeric, the cnst expr part is folded down to a = expr_val + (x << 2). If 'x' is
+an obj, try to call cast. If the cast fails, error-out; ops for primitives can't be overloaded,
+and commutativity isn't a thing.
+
+
++------+
+| Refs |
++——————+
+
+Pointers don't exist per se; what exists are safer reference types.
+Ref types are treated exactly the same as value types for ops, methods, fields. It only
+differs in identity and when using litcast (@cast)
+
+Refs shall be treated as a carefully managed 4B ptr wrapper
+
+
+Rules
+—————
+
+1. DOES NOT work on seq/hashed types; they are already ref-ed.
+
+2. Multi-refs (ref ref ...) aren't allowed.
+
+3. Copy-semantics
+
+For primitives, '=' changes value (except for first assignment).
+Use -> to change ref. Using '->' makes types implied:
+
+a -> foo.b_i32  // ref i32 a
+
+
+For objs, '=' changes ref. Use a.assign(b) to change value.
+
+4. nullref (aliased as '?')
+
+nullref is 0xFFFFFFFF. Use the 'is' kwd for this (and never ==).
+It gets compiled down to a JE_I/JNE_I check.
+
+ref x  // default val is 0
+if x is ?: ...  // [JNE_I] [$x] [-1] [+n]
+
+
+You're free to assign this -1 alias to vars appropriately:
+
+i = nullref  // same as i = -1
+// or i = ?
+
+
+5. Risky casts
+
+"@cast" is a litcast (literal cast) which only changes the way the compiler
+treats the data, without attempting a type-conversion. Note: when no
+type-conversions are available, litcast is the default.
+
+a = (@cast i32)obj_ref  // use @cast to cast ref to i32 and back
+b = (ref Bar)foo  // since a is already a ref, @cast isn't necessary here
+c = (@cast ref Foo)a
+
+raw str raw_s = s  // refer "seq"
+
+
+6. void ref (ref?)
+
+ref Foo a()
+b = (Bar)a  // tries to cast the Foo obj to Bar
+ref? a_ = a
+b = (Bar)a_  // reads Bar from the ptr
+
+c = (ref Bar)x  // either works here
+
+d = (i32)a_  // tries to read an int from the header; use @cast for casting ref
+
+
++----------+
+| LOAD/STO |
++——————————+
+
+There are three types of load/store variants:
+
+
+1. LOAD IMM ADDR
+————————————————
+
+[LDI] [$d] [addr_imm: 19]
+
+Starts from the GLO (stack bottom). Used exclusively for accessing globals (512KB addressable space).
+
+
+2. LOAD REG ADDR, IMM OFF
+——————————————————————————
+
+# All offsets are scaled according to width, as data is always aligned.
+
+[LDR] [$d] [$base] [s_off: 14]
+
+Starts from GLO (can address the whole memory, albeit |s_off| being limited to 8KB * w). Neg offset from s_off
+is scaled by the width variant. Used when offset is known at compile time; obj fields, static arr idx, stack frm
+preamble.
+
+
+3. LOAD REG ADDR, REG OFF
+——————————————————————————
+
+[LDRR] [$d] [$base] [$s_off]
+
+(2)'s variant, used commonly for array access with dyn idx.
+
+
+4. LOAD FRM PTR OFFSET
+——————————————————————
+
+[LD_FPO] [$d] [s_off: 19]
+
+For accessing data in the current stack frame (|s_off| addressable size is 256KB, which is the max stack-frm sz).
+Use LDR for upvals, as closure_fp will be known.
+
+
+5. LOAD SP PTR OFFSET
+—————————————————————
+
+[LD_SP] ...
+
+Used for pushing/popping from the stack; loading/unloading res/arg to game instrs
+
+
+6. Load immediate
+—————————————————
+
+Two variants present for performance and convenience:
+
+[LDVAL] [$d]
+[val: 32]
+
+[LDVAL_19] [$d] [val: 19]
+
+
+Width categories
+————————————————
+
+Each of the above must specify a width variant. LD has 8U, 8S, 16U, 16S variants while STO has 8, 16:
+
+LDI_FPO_16S, STOI_8, etc.
+
+Note: The default width is 32-bit. LDI_FPO exists; LDI_FPO_32 doesn't.
+
+
+Abs FPO and scaling
+———————————————————
+
+FP-offset to absolute (LEA):
+[LDA_FPO] [$d] [s_off: 19]
+
+
+Scaling (any u32):
+[ISCALE] [$d] [$base] [$idx] [mul: 9]
+
+
+Memory bulk ops
+———————————————
+
+// address starts at the start of the const pool; this pool can only be read via memmov, as it only stores
+multi-word data. Splitting into I and R is a sane compromise between expending an opcode and cutting an extra
+LDVAL (which expends another vreg).
+[MEMMOV_I] [$d] [$s] [bytes: 16KB]
+[MEMMOV_R] [$d] [$s] [$n] [mult: 9]  // n * mult moved
+
+
+// NOT split into I and R variants because MEMREP is used for streams larger than common MEMCPYs.
+[MEMREP] [$d] [$s] [$rep] [$bytes]
+
+
+[REGCPY] [$d] [$s]  // for register shuffling / creating temps; STOI would require an additional LDA_FPO.
+
+
+For heap ALLOC ops, refer "MemModel".

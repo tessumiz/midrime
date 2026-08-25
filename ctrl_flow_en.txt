@@ -1,0 +1,341 @@
++--------------+
+| Jumps primer |
++——————————————+
+
+Jumps are relative by default (to fit the addr in the measly 4B instr budget). Types:
+JMP, JE, JNE, JLT, JLE, JLUK, JBIN, JBIN_STR, JEQ_OEN_W. Plus:
+
+[JE_I] [$x] [s_imm: 5] [s_off: 14]
+[JNE_I] ...
+
+s_imm has a range from -16 to 15, thus covering 0 (JZ/JNZ) and -1 (nullref check).
+
+
+Wide jumps and short variants
+—————————————————————————————
+
+The standard max-offset is 19b:
+[JMP] [s_off_w: 19]  // allows ±256K instrs worth of address space
+[JZ]  [$x] [s_off_w: 19]
+[JNZ] [$x] [s_off_w: 19]
+
+
+Some variants use shorter offsets:
+[JLT] [$a] [$b] [s_off: 14]   // ±8192 instrs of address space, enough for common cases
+[JLE] ...  // GT/GE compile to this
+
+
+In case such a jmp must exceed ±8192, the compiler splits JLT into LT and JNZ.
+
+
+Examples
+————————
+
+Ranges (start)..(end)..(step) are just syntactic sugar, ONLY to be used with for loops:
+
+for i in 1..10..2:
+  if foo(): break
+
+...
+LDVAL_19 [$i] [1]
+LDVAL_19 [$n] [10]
+[JMP] [+4]  // aka to [JLT]
+
+LOOP:
+[CALL] [$t] [foo_ptr]
+[JNZ]  [$t] [+2]
+[IADD] [$i] [$i] [2]
+[JLT] [$i] [$n] [-2]
+
+END:
+...
+
+
+Loops also support (idx, val) syntax for sequences:
+
+for { i, x } in lst.enum:
+  // syntactic sugar
+
+
+for { a, b, c } in ((1, 2, 3), (4, 5, 6)):
+  // unpacking
+
+You may omit the braces too
+
+
+Currently, there is no iterator protocol support; .next() support will be added in the
+future (just like the dict instr).
+
+
+Nested ternary ops are supported:
+
+cond1 ? val1 : cond2 ? val2 : ...
+
+
+
++-------+
+| Match |
++———————+
+
+One of the most versatile statements. Works on nums, strs, lists, objs, enums and boxed
+types (refer "oops and boxing" for an idea). Unlike Rust, Midrime's matches can't yield
+values; they aren't expressions.
+
+
+Numeric
+———————
+
+All cases (including x) are either cast to i32 or f32. Floats necessarily decay to if-elif chains;
+only ints can be optimized.
+
+match x:
+  12:
+    // breaks by default
+  100, 105:
+    // grouped cases allowed with 0 runtime penalty
+  _:
+    // default
+
+
+Checks are performed to decide the optimal implementation.
+
+1. If cases <= 4 (including default), a JEQ chain is used (table overhead outweighs
+its benefits. A similar metric to LLVM).
+
+2. Else, the data is sorted and a density metric (cases/span) is compared (span = max-min+1):
+
+
+(i) density >= 20% and span <= 1024 (hard cap on lk entries), a lookup table is generated:
+
+JLUK calcs idx = (unsigned)(x-min). If idx > (max-min), it jumps to default (+3). Else, jumps to
+u_off_arr[idx]
+
+[JLUK] [$x] [u_off_len: 19]  // (max_case - min_case + 1) would be slow
+[min_case: 4B]  // idx = $x-min_case
+[max_case: 4B]
+[deflt_blk: 4B]
+[2B u_off lk table]  // no 4B fallback; 64K more than enough for a single match block
+// this array is 4B-aligned (aka a 2B padding at the end if needed)
+// any non-cases would be filled with offset to the deflt_blk
+
+<CASE BLOCKS>
+// Grouped cases lead to the same dest block.
+// Breaks inserted by default
+
+
+(ii) Else bin search will be used:
+
+[JBIN] [$x] [u_off_len: 19]  // if bin search fails, jumps to deflt_blk
+[deflt_blk: 4B]
+[4B val | 4B u_off dense arr (sorted acc to val)]
+
+
+Strings and objs
+————————————————
+
+The same, except only bin search is used on the hash via [JBIN_STR], and the dense arr is:
+
+[4B hash | 4B cnst_ref | 4B u_off]  // sorted according to hash; handles collisions too. The hash
+field has been added separately to reduce cache misses. Clusters having similar hashes will be
+scanned for the correct value on either sides of the target.
+
+
+Any obj match always decays to the if-elif chain. 'foo' can't be a primitive (refer "objs
+and boxing"). If Foo foo doesn't have an equals overload for any case, the compiler will check
+if equals(Foo, Foo) is defined AND if Bar bar defines a cast function. If so, it emits a cast
+followed by a check.
+
+match foo:
+  foo2: // type Foo
+  bar: // type Bar with 'cast Foo' defined
+  ...
+
+...  // push equ_fptr's args
+[CALL] [$t] [equ_fptr]
+[JZ] [$t] [next_case]
+// foo2 case
+[JMP] [END_off]
+
+[CALL] [$t] [cast_fptr]
+[CALL] [$t] [equ_fptr]
+// bar case
+[JMP] [END_off]
+
+END:
+
+
+
++-------+
+| Enums |
++———————+
+
+Regular enums are very basic; just like C-enums:
+
+En Foo [ A, B, C, D ] foo
+foo = D  // u32 foo = 3; other types like i16 foo = D work too
+
+
+There are two other kinds of enums; orthogonal, and its dirty-tracking variant.
+Their size can be 1, 2 or 4B; they are still primitive types.
+
+
+OEn (ortho enum)
+================
+
+
+Type definition variants
+————————————————————————
+
+OEn Foo [
+  X: [a, b, c],  // default init uses the first val, X = a
+  Y: [d, *e],   // asterisk fixes init val; .Y = e
+  Z: [b, f]
+] foo  // one-line decl + init; init is optional
+
+OEn Foo [X, Y]  // same as [ X: [F, T], Y: [F, T] ]
+OEn Foo [[A, B]]  // [ _mangled_name: [A, B] ]
+
+
+Init and storage
+————————————————
+
+Foo foo = [a, Z.bm, *n]  // stores [X: a, Y: e, Z: b]
+Foo foo = f  // if 'f' is an enum val, assigns it. Elif anything
+else, tries to treat 'foo' as a numeric type and assign f to it
+(particularly useful for masks)
+
+Foo is bit-packed as:
+[pad: 4 | X: 2 | Y: 1 | Z: 1]  // 1B
+
+The size can either be 1, 2 or 4B; a rational max cap of 4B exists.
+You can compulsorily force a size by:
+
+OEn<16> Foo [ A, B, C ]  // 16B; little-endian with the rest of the
+significant bits cleared
+
+
+Comparison
+———————————
+
+Trying to access fields individually might not work as expected:
+
+OEn Foo [ [A, B, C], [D, E, F] ] foo
+
+foo.E  // evals to 4; normal enum order
+foo.D == 3  // true
+
+OEn Foo [ A: [F, T], B: [F, T] ] foo can be used as
+if Foo.B: ...  // implicitly boils down to Foo.B == F (first-val check)
+
+
+foo == foo2  // enums can only be compared if the OEn types match
+[EQ] [$t] [$foo] [$foo2]
+
+foo == Foo [a, b]  // illegal; must create enums explicitly
+foo == a  // make sure val 'a' isn't masked by some var
+foo == @[a, k.b, r]  // used for AND-ing fields
+
+foo == @[a, b]  // 'b' ambiguous; specify X.b or Z.b
+
+foo == @[a, X.b, *]  // '*' means consider all the unspecified fields with their defaults,
+unlike @[a, X.b] which simply masks-out those to prevent checks
+
+
+For non-negated and AND-ed field comparisons, the compiler generates two bitmasks, one
+for isolating the required fields and the other the expected value:
+
+[LDVAL] [$m]
+[mask of the required fields]
+[AND] [$t] [$foo] [$m1]
+
+[LDVAL] [$m]
+[expected value from comparison]
+
+[JEQ] [$t] [$m] [s_off]
+
+
+Instead of the above, a special 3-word instr is emitted:
+
+[JEQ_MASK_W] [$en] [s_off_w]  // enum comps usually result in a jump; most common case
+[mask: 4B]
+[expected: 4B]
+
+
+Negations compile to separate checks; they're slow, don't use them unless necessary:
+foo == [a, b, c, !d, !e, !f]
+
+[JNE_MASK_W] ...
+// for d, e, f
+[JEQ_MASK_W] ...
+// for a, b, c
+
+
+Note: None of the above equality checks create enums in the rval.
+
+
+Transition
+———————————
+
+foo = [a, b]   // overwrites
+foo -> a  // trans
+foo -> [a, b]
+foo -> [a, b, *]  // the only diff bw this and = [a, b] is for DEn
+
+[TRANS_OEN] [$en]
+[clr_mask : 4B]  // to be AND-ed with
+[new_state: 4B]  // to be OR-ed with
+
+
+DEn (dirty enum)
+================
+
+Dirty bits are reserved for each field and gets set during a transition:
+
+
+Init and transition
+———————————————————
+
+DEn Foo [ X: [a, b, c], Y: [x, y] ]
+[pad: 1 | dirty: 2 | X: 3 | Y: 2]  // dirty = 00 initially
+
+Foo -> a  // dirty = 10
+[TRANS_DEN] [$en]  // clr_mask and new_state must contain the dirty-bit data
+[clr_mask : 4B]
+[new_state: 4B]
+
+Foo -> y  // dirty = 11
+if Foo.X.chg:
+  // dirty = 01
+  clr Foo.Y  // 00 now
+
+Foo.chg checks if any field is dirty, and clr Foo resets all dirty bits.
+
+
+Casting
+———————
+All enum types are treated as u8, u16 or u32. Casting is done accordingly.
+
+
+
+StateCheckExpr
+——————————————
+
+These work on @state:
+
+@X:
+@[!X, Y, !K.Z]:
+
+if @[X, !Y] and foo():
+
+
+But inside match, a StateCheckExpr doesn't favour the registered @state:
+
+match foo.st:
+  @[F, K]:  // works on foo.st
+
+
+Note: only in game mode are there implicitly done:
+
+match ent:
+  @...  // if "ent" is resolved and mixes EntHead, ent.state; elif of type EntHead (unresolved),
+uses ent.typ_id. Beware.
