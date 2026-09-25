@@ -15,9 +15,9 @@ cls ConnMgr:
         q << packs
             => sel !bad
             => map  bad.trim().upr()
-            => dec  bad
-        
-        if q.len > 50 and #Connected:
+            => desc bad
+
+        #Connected && q.len > 50:
             print("foo")
         
     tick(t):
@@ -28,14 +28,14 @@ cls ConnMgr:
                     ret++
                     rst
 
-            es: -> Fault
+            _: -> Fault
         
         - #Connecting:
             prob 80%:
                 -> Connected
                 .ret = 0
 
-            es: -> Disconnected
+            _: -> Disconnected
         
         - #Connected:
             proc_q
@@ -62,7 +62,7 @@ loop 100:
             
         ]
     }
-    
+
     use mgr // experimental; might include support for scoped indented block, multiple, etc.
 
     .ingest(new)

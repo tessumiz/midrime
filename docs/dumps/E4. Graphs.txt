@@ -1,0 +1,81 @@
+En TaskState [ Pending, Running, Failed, Resolved ]
+
+cls GraphExecutor:
+    nodes = [:]
+    state_map = [:]
+    max_retries = 0
+
+    init(.max_retries: 3): @fill
+
+    reg(task_id, deps, compute, priority: 10):
+        nodes[task_id] = [
+            deps: Set(deps),
+            fn: compute,
+            prio: priority,
+            retries: 0
+        ]
+
+        state_map[task_id] = #Pending
+
+
+    exec_all:
+        ready_q = MinHeap()
+
+        in_deg = nodes as (tid, data) => sel (tid, data['deps'].len) => dict
+        graph  = nodes as tid => sel (tid, []) => dict
+
+        nodes as (tid, data)
+            => sel  (tid, data['deps'] as deps)
+            => loop dep in deps
+            => filt dep in graph
+            => graph[dep] += tid
+
+        in_deg as (tid, deg)
+            => filt deg == 0
+            => ready_q.push(tid, -.nodes[tid]['prio'])
+
+        results = [:]
+
+        while ready_q:
+            curr_id = ready_q.pop()
+
+            state_map[curr_id] = #Running
+            node = nodes[curr_id]
+
+            try:
+                res_args = node['deps'] as dep
+                    => sel (dep, results[dep])
+                    => dict
+
+                results[curr_id] = node['fn'](res_args)
+                state_map[curr_id] = #Resolved
+
+                graph[curr_id] as neigh => {
+                    in_deg[neigh] -= 1
+                    if in_deg[neigh] == 0:
+                        ready_q += (neigh, -nodes[neigh]['prio'])
+                }
+            catch err:
+                node['retries']++
+
+                if node['retries'] < max_retries:
+                    state_map[curr_id] = #Pending
+                    ready_q += (curr_id, -node['prio'])
+                _:
+                    state_map[curr_id] = #Failed
+                    _fail_cascade(curr_id, graph)
+
+        results, state_map
+
+    _fail_cascade(start_id, graph):
+        stack = [start_id]
+
+        while stack:
+            curr = stack.pop()
+
+            graph[curr] as neigh
+                => filt state_map[neigh] != #Failed
+                => {
+                    stack += neigh
+                    state_map[neigh] = #Failed
+                }

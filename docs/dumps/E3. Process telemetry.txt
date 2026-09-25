@@ -1,0 +1,46 @@
+proc_stream(streams, ttl_sec: 300):
+    sessions = [:]
+    cache = [:]
+
+    act_evs = (
+        (ts, payload) for stream in streams 
+        for ev in stream if (ts := ev.get("t", 0)) > time.time() - ttl_sec
+        and (payload := ev.get("data"))
+    )
+
+    act_evs = streams
+        => loop ev
+        => filt (ts := ev.get("t", 0)) > time()-ttl_sec and
+                (payload := ev.get("data"))
+
+        => sel (ts, payload) as (ts, data)
+        => filt {
+            check data:
+                [id: sid, INIT: cfg, cfg: [mode: mode, ...cfg_rest]]:
+                    cache[sid] = [mode: mode, active: true, meta: cfg_rest]
+
+                [...]:
+                    buf = sessions[sid]
+                    buf += first, ...rest, last
+
+                    if buf.len >= 10 and (buff[-10..] => filt v > 0 => sum) > 1000:
+                        cache[sid]["active"] = false
+                        give [alert: "OVERLOAD", id: sid, spike: last]
+                
+                dict:
+                    if dropped := sessions.pop(sid, []).len:
+                        give [...]
+
+                    cache.pop(sid, nil)
+        }
+    
+
+    cutoff = time() - ttl_sec
+    return {
+        sid: buf for sid, buf in sessions.items() 
+        if buf and (cache.get(sid, {}).get("last_t", 0) > cutoff)
+    }
+
+    sessions as sid, buf
+        => filt (buf and cache.get(sid, [:]).get("last_t", 0) > cutoff)
+        => dict

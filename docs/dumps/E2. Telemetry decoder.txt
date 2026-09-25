@@ -35,13 +35,14 @@ cls Telemetry:
                 history[sid] = [:]
 
             reads = ev_lst as e
-                => { e["value"] ?? 0.0 } sel e["is_valid"] ?? nil
+                => sel e["is_valid"] ?? nil
+                => e["value"] ?? 0.0
 
             history[sid] << reads
             avg = ma_calc(history[sid])
 
-            sensor_type = ev_lst ? (ev_lst[0]["type"] ?? "unknown") :
-                          "unknown"
+            sensor_type =
+                ev_lst ? (ev_lst[0]["type"] ?? "unknown") : "unknown"
 
             limit = get_thr(sensor_type, "temp")
 
@@ -53,7 +54,8 @@ cls Telemetry:
                 ]
 
         act_alerts as alert
-            => print("foo") if alert["avg"] > alert["limit"] * 1.5
+            => sel alert["avg"] > alert["limit"] * 1.5
+            => print("foo")
 
 
 cfg = [
